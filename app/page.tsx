@@ -2,6 +2,8 @@
 
 import { useState, useRef, useEffect } from "react";
 
+type PdfDoc = { name: string; size: number; pages: number; text: string };
+
 export default function Home() {
   const [isRecording, setIsRecording] = useState(false);
   const [audioBlob, setAudioBlob] = useState<Blob | null>(null);
@@ -15,7 +17,8 @@ export default function Home() {
   const [customPrompt, setCustomPrompt] = useState("");
   const [topicAnalysis, setTopicAnalysis] = useState<string>("");
 
-  const [pdfFiles, setPdfFiles] = useState<File[]>([]);
+  const [pdfDocs, setPdfDocs] = useState<PdfDoc[]>([]);
+  const [readingPdf, setReadingPdf] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -29,24 +32,53 @@ export default function Home() {
     };
   }, [audioUrl]);
 
-  // ---------- PDFs ----------
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files || []);
-    const validPdfs = files.filter((file) => file.type === "application/pdf");
+  // ---------- PDFs: se leen en el navegador, no se suben ----------
+  const extractPdfText = async (file: File) => {
+    const pdfjs = await import("pdfjs-dist");
+    pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
 
+    const data = new Uint8Array(await file.arrayBuffer());
+    const pdf = await pdfjs.getDocument({ data }).promise;
+
+    let text = "";
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i);
+      const content = await page.getTextContent();
+      const pageText = content.items.map((it: any) => ("str" in it ? it.str : "")).join(" ");
+      text += `\n[Página ${i}]\n${pageText}`;
+    }
+    return { text: text.trim(), pages: pdf.numPages };
+  };
+
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+
+    const validPdfs = files.filter((f) => f.type === "application/pdf");
     if (validPdfs.length !== files.length) alert("Solo se permiten archivos PDF.");
-    if (pdfFiles.length + validPdfs.length > 5) {
+    if (pdfDocs.length + validPdfs.length > 5) {
       alert("Máximo 5 archivos PDF permitidos.");
       return;
     }
 
-    setPdfFiles((prev) => [...prev, ...validPdfs]);
-    if (fileInputRef.current) fileInputRef.current.value = "";
+    setReadingPdf(true);
+    for (const file of validPdfs) {
+      try {
+        const { text, pages } = await extractPdfText(file);
+        if (text.replace(/\[Página \d+\]/g, "").trim().length < 50) {
+          alert(`"${file.name}" parece un PDF escaneado (sin texto). No se puede leer así.`);
+          continue;
+        }
+        setPdfDocs((prev) => [...prev, { name: file.name, size: file.size, pages, text }]);
+      } catch (err) {
+        console.error(err);
+        alert(`No se pudo leer "${file.name}".`);
+      }
+    }
+    setReadingPdf(false);
   };
 
-  const removePdf = (indexToRemove: number) => {
-    setPdfFiles((prev) => prev.filter((_, index) => index !== indexToRemove));
-  };
+  const removePdf = (i: number) => setPdfDocs((prev) => prev.filter((_, idx) => idx !== i));
 
   // ---------- Grabación ----------
   const startRecording = async () => {
@@ -66,14 +98,13 @@ export default function Home() {
         setAudioUrl(URL.createObjectURL(blob));
         setTranscription("");
         setTopicAnalysis("");
-        stream.getTracks().forEach((track) => track.stop());
+        stream.getTracks().forEach((t) => t.stop());
       };
 
       mediaRecorder.start();
       setIsRecording(true);
       setRecordingTime(0);
-
-      timerRef.current = setInterval(() => setRecordingTime((prev) => prev + 1), 1000);
+      timerRef.current = setInterval(() => setRecordingTime((p) => p + 1), 1000);
     } catch {
       alert("No se pudo acceder al micrófono. Concede los permisos necesarios.");
     }
@@ -100,7 +131,7 @@ export default function Home() {
     setRecordingTime(0);
   };
 
-  // ---------- Transcripción (servidor) ----------
+  // ---------- Transcripción ----------
   const transcribeAudio = async () => {
     if (!audioBlob) return;
     setIsProcessing(true);
@@ -116,19 +147,18 @@ export default function Home() {
       if (!response.ok) throw new Error(data.error || "Error en la transcripción");
 
       setTranscription(data.text || "No se detectó voz.");
-      setProcessStatus("");
     } catch (err) {
       console.error(err);
       setTranscription(`❌ Error: ${err instanceof Error ? err.message : "Fallo al transcribir"}`);
-      setProcessStatus("");
     } finally {
+      setProcessStatus("");
       setIsProcessing(false);
     }
   };
 
-  // ---------- Análisis (servidor) ----------
+  // ---------- Análisis con streaming ----------
   const analyzeWithAI = async () => {
-    if (!transcription && pdfFiles.length === 0) {
+    if (!transcription && pdfDocs.length === 0) {
       alert("Debes grabar audio o subir al menos un PDF para analizar.");
       return;
     }
@@ -138,35 +168,53 @@ export default function Home() {
     }
 
     setIsProcessing(true);
-    setProcessStatus("La IA está razonando la respuesta...");
+    setProcessStatus("La IA está pensando...");
     setTopicAnalysis("");
 
     try {
-      const formData = new FormData();
-      formData.append("prompt", customPrompt.trim());
-      formData.append("transcription", transcription);
-      pdfFiles.forEach((f) => formData.append("pdfs", f));
+      const response = await fetch("/api/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt: customPrompt.trim(),
+          transcription,
+          documents: pdfDocs.map((d) => ({ name: d.name, text: d.text })),
+        }),
+      });
 
-      const response = await fetch("/api/analyze", { method: "POST", body: formData });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || "Error al analizar");
+      if (!response.ok || !response.body) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(data.error || "Error al analizar");
+      }
 
-      setTopicAnalysis(data.analysis);
-      setProcessStatus("");
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let first = true;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (first) {
+          setIsProcessing(false);
+          setProcessStatus("");
+          first = false;
+        }
+        const chunk = decoder.decode(value, { stream: true });
+        setTopicAnalysis((prev) => prev + chunk);
+      }
+
+      if (first) setTopicAnalysis("La IA devolvió una respuesta vacía. Intenta de nuevo.");
     } catch (err) {
       console.error(err);
       setTopicAnalysis(`❌ Error: ${err instanceof Error ? err.message : "Fallo de conexión."}`);
-      setProcessStatus("");
     } finally {
+      setProcessStatus("");
       setIsProcessing(false);
     }
   };
 
-  const formatTime = (seconds: number) => {
-    const mins = Math.floor(seconds / 60);
-    const secs = seconds % 60;
-    return `${mins.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`;
-  };
+  const formatTime = (s: number) =>
+    `${Math.floor(s / 60).toString().padStart(2, "0")}:${(s % 60).toString().padStart(2, "0")}`;
 
   const copyToClipboard = (text: string, label: string) => {
     navigator.clipboard.writeText(text);
@@ -180,9 +228,7 @@ export default function Home() {
           <h1 className="text-3xl font-semibold tracking-tight text-black dark:text-zinc-50 sm:text-4xl">
             Transcriptor Profesional + IA
           </h1>
-          <p className="text-base text-zinc-600 dark:text-zinc-400">
-            Audio, PDFs y Razonamiento de alta potencia.
-          </p>
+          <p className="text-base text-zinc-600 dark:text-zinc-400">Audio, PDFs y razonamiento de alta potencia.</p>
         </div>
 
         <div className="rounded-2xl border border-zinc-200 bg-white p-6 shadow-sm dark:border-zinc-800 dark:bg-zinc-950 sm:p-8">
@@ -240,17 +286,21 @@ export default function Home() {
                   multiple
                   ref={fileInputRef}
                   onChange={handleFileChange}
-                  className="block w-full text-sm text-zinc-500 file:mr-4 file:rounded-lg file:border-0 file:bg-indigo-600 file:px-4 file:py-2.5 file:text-sm file:font-semibold file:text-white hover:file:bg-indigo-700 cursor-pointer"
+                  disabled={readingPdf}
+                  className="block w-full cursor-pointer text-sm text-zinc-500 file:mr-4 file:rounded-lg file:border-0 file:bg-indigo-600 file:px-4 file:py-2.5 file:text-sm file:font-semibold file:text-white hover:file:bg-indigo-700 disabled:opacity-50"
                 />
+                {readingPdf && <p className="text-sm text-indigo-600 dark:text-indigo-300">Leyendo PDF...</p>}
 
-                {pdfFiles.length > 0 && (
+                {pdfDocs.length > 0 && (
                   <ul className="space-y-2">
-                    {pdfFiles.map((file, index) => (
+                    {pdfDocs.map((doc, index) => (
                       <li key={index} className="flex items-center justify-between rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 text-sm dark:border-zinc-800 dark:bg-zinc-900">
                         <div className="flex items-center gap-2 truncate">
                           <span className="text-red-500">📄</span>
-                          <span className="truncate text-zinc-700 dark:text-zinc-300">{file.name}</span>
-                          <span className="text-xs text-zinc-400">({(file.size / 1024 / 1024).toFixed(2)} MB)</span>
+                          <span className="truncate text-zinc-700 dark:text-zinc-300">{doc.name}</span>
+                          <span className="text-xs text-zinc-400">
+                            ({doc.pages} pág. · {(doc.text.length / 1000).toFixed(0)}k caracteres)
+                          </span>
                         </div>
                         <button onClick={() => removePdf(index)} className="ml-2 rounded p-1 text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20" title="Eliminar archivo">
                           ✕
@@ -288,14 +338,14 @@ export default function Home() {
               </div>
             )}
 
-            {/* 4. ANALIZAR CON IA */}
-            {(transcription || pdfFiles.length > 0) && !isProcessing && (
+            {/* 5. ANALIZAR CON IA */}
+            {(transcription || pdfDocs.length > 0) && !isProcessing && !topicAnalysis && (
               <div className="space-y-3 rounded-lg border border-purple-200 bg-purple-50 p-4 dark:border-purple-900 dark:bg-purple-950/30">
                 <h3 className="text-sm font-semibold text-purple-900 dark:text-purple-200">5. ¿Qué quieres analizar?</h3>
                 <textarea
                   value={customPrompt}
                   onChange={(e) => setCustomPrompt(e.target.value)}
-                  placeholder="Ej: Resume los puntos clave de la clase y crea 5 preguntas de repaso."
+                  placeholder="Ej: Resume los puntos clave y crea 5 preguntas de repaso."
                   className="w-full rounded-lg border border-purple-300 bg-white px-3 py-2 text-sm text-zinc-900 placeholder:text-zinc-400 focus:border-purple-500 focus:outline-none focus:ring-2 focus:ring-purple-500/20 dark:border-purple-700 dark:bg-zinc-900 dark:text-zinc-100"
                   rows={3}
                 />
@@ -315,7 +365,7 @@ export default function Home() {
                   <h3 className="text-sm font-semibold text-purple-900 dark:text-purple-200">✅ Resultado</h3>
                   <button onClick={() => copyToClipboard(topicAnalysis, "Análisis")} className="text-xs font-medium text-purple-700 underline hover:text-purple-900 dark:text-purple-300">Copiar</button>
                 </div>
-                <p className="whitespace-pre-wrap text-base font-medium leading-relaxed text-purple-950 dark:text-purple-100">{topicAnalysis}</p>
+                <p className="whitespace-pre-wrap text-base leading-relaxed text-purple-950 dark:text-purple-100">{topicAnalysis}</p>
                 <button onClick={() => setTopicAnalysis("")} className="text-xs font-medium text-purple-700 underline hover:text-purple-900 dark:text-purple-300">Hacer otra pregunta</button>
               </div>
             )}
