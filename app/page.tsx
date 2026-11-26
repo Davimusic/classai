@@ -2964,6 +2964,8 @@ type Notice = { level: "error" | "warn" | "info"; text: string };
 type ChunkResult = { text: string; segments: Segment[] };
 type DictState = "idle" | "live" | "rec" | "busy";
 type QuizQ = { question: string; options: string[]; correct: number; explanation: string; ref: string; at: number | null };
+type SavedSession = { id: string; title: string; createdAt: string; duration: number; hasTranscript: boolean };
+type SaveStatus = "idle" | "saving" | "saved" | "error";
 
 const MAX_SECONDS = 7200;
 const MAX_UPLOAD_SECONDS = 7500;
@@ -3297,6 +3299,22 @@ export default function Home() {
   const [mode, setMode] = useState<Mode>("answer");
   const [copied, setCopied] = useState("");
 
+  // ---------- Nube (Backblaze) ----------
+  const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
+  const [saveError, setSaveError] = useState("");
+  const [sessions, setSessions] = useState<SavedSession[]>([]);
+  const [sessionsLoading, setSessionsLoading] = useState(false);
+  const [sessionsError, setSessionsError] = useState("");
+  const [openingId, setOpeningId] = useState("");
+  const sessionIdRef = useRef("");
+  const audioKeyRef = useRef("");
+  const audioTypeRef = useRef("");
+  const titleRef = useRef("");
+  const createdAtRef = useRef("");
+  const durationRef = useRef(0);
+  const transcriptRef = useRef<{ text: string; segments: Segment[] }>({ text: "", segments: [] });
+  const pendingRef = useRef<{ blob: Blob } | null>(null);
+
   const [isSpeaking, setIsSpeaking] = useState(false);
 
   const [pdfDocs, setPdfDocs] = useState<PdfDoc[]>([]);
@@ -3389,7 +3407,12 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    const need = isRecording || isProcessing || preparing || (!!audioBlob && !transcription);
+    const need =
+      isRecording ||
+      isProcessing ||
+      preparing ||
+      saveStatus === "saving" ||
+      (!!audioBlob && !transcription && saveStatus !== "saved");
     if (!need) return;
     const h = (e: BeforeUnloadEvent) => {
       e.preventDefault();
@@ -3397,7 +3420,7 @@ export default function Home() {
     };
     window.addEventListener("beforeunload", h);
     return () => window.removeEventListener("beforeunload", h);
-  }, [isRecording, isProcessing, preparing, audioBlob, transcription]);
+  }, [isRecording, isProcessing, preparing, audioBlob, transcription, saveStatus]);
 
   useEffect(() => {
     if (!isRecording) {
@@ -3483,8 +3506,184 @@ export default function Home() {
 
   const removePdf = (i: number) => setPdfDocs((prev) => prev.filter((_, idx) => idx !== i));
 
+  // ---------- Guardado en la nube ----------
+  const refreshSessions = async () => {
+    setSessionsLoading(true);
+    setSessionsError("");
+    try {
+      const r = await fetch("/api/storage/sessions", { cache: "no-store" });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.error || "No pude cargar tus clases guardadas.");
+      setSessions(d.sessions || []);
+    } catch (err) {
+      setSessionsError(err instanceof Error ? err.message : "No pude cargar tus clases guardadas.");
+    } finally {
+      setSessionsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    refreshSessions();
+  }, []);
+
+  // Escribe la clase en la nube con lo que haya hasta ahora (audio y, si existe, transcripción)
+  const saveSession = async (): Promise<boolean> => {
+    if (!sessionIdRef.current || !audioKeyRef.current) return false;
+    const res = await fetch("/api/storage/session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: sessionIdRef.current,
+        title: titleRef.current,
+        createdAt: createdAtRef.current,
+        audioKey: audioKeyRef.current,
+        audioType: audioTypeRef.current,
+        duration: durationRef.current,
+        peaks: peaksRef.current.map((p) => Math.round(p * 100)),
+        transcription: transcriptRef.current.text,
+        segments: transcriptRef.current.segments,
+      }),
+    });
+    if (!res.ok) {
+      const d = await res.json().catch(() => ({}));
+      throw new Error(d.error || "No se pudo guardar la clase.");
+    }
+    return true;
+  };
+
+  const uploadAudio = async (blob: Blob, duration: number) => {
+    setSaveStatus("saving");
+    setSaveError("");
+    pendingRef.current = { blob };
+    durationRef.current = duration;
+
+    const id = sessionIdRef.current || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    sessionIdRef.current = id;
+
+    try {
+      const type = blob.type || "application/octet-stream";
+      const ext = type.includes("webm")
+        ? "webm"
+        : type.includes("mp4") || type.includes("m4a")
+        ? "m4a"
+        : type.includes("mpeg") || type.includes("mp3")
+        ? "mp3"
+        : type.includes("wav")
+        ? "wav"
+        : type.includes("ogg")
+        ? "ogg"
+        : "bin";
+
+      if (!createdAtRef.current) {
+        const now = new Date();
+        createdAtRef.current = now.toISOString();
+        titleRef.current = "Clase del " + now.toLocaleString("es-CO", { dateStyle: "medium", timeStyle: "short" });
+      }
+
+      const r = await fetch("/api/storage/upload-url", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id, contentType: type, ext }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.error || "No se pudo preparar el guardado.");
+
+      const put = await fetch(d.url, { method: "PUT", headers: { "Content-Type": type }, body: blob });
+      if (!put.ok) throw new Error("La nube rechazó el audio. Revisa la clave y el bucket.");
+
+      if (sessionIdRef.current !== id) return; // el usuario descartó esta clase mientras subía
+      audioKeyRef.current = d.key;
+      audioTypeRef.current = type;
+      await saveSession();
+      if (sessionIdRef.current !== id) return;
+
+      pendingRef.current = null;
+      setSaveStatus("saved");
+      refreshSessions();
+    } catch (err) {
+      console.error(err);
+      if (sessionIdRef.current !== id) return;
+      setSaveStatus("error");
+      setSaveError(
+        err instanceof TypeError
+          ? "No pude conectar con la nube. Revisa las reglas CORS del bucket y tu conexión."
+          : err instanceof Error
+          ? err.message
+          : "No se pudo guardar la clase."
+      );
+    }
+  };
+
+  const retrySave = async () => {
+    if (pendingRef.current) {
+      uploadAudio(pendingRef.current.blob, durationRef.current);
+      return;
+    }
+    setSaveStatus("saving");
+    setSaveError("");
+    try {
+      await saveSession();
+      setSaveStatus("saved");
+      refreshSessions();
+    } catch (err) {
+      setSaveStatus("error");
+      setSaveError(err instanceof Error ? err.message : "No se pudo guardar la clase.");
+    }
+  };
+
+  const openSession = async (id: string) => {
+    if (openingId) return;
+    resetRecording();
+    setOpeningId(id);
+    try {
+      const r = await fetch(`/api/storage/session?id=${encodeURIComponent(id)}`, { cache: "no-store" });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.error || "No pude abrir esta clase.");
+
+      sessionIdRef.current = id;
+      audioKeyRef.current = d.audioKey;
+      audioTypeRef.current = d.audioType || "";
+      titleRef.current = d.title || "";
+      createdAtRef.current = d.createdAt || "";
+      durationRef.current = d.duration || 0;
+      transcriptRef.current = { text: d.transcription || "", segments: d.segments || [] };
+
+      peaksRef.current = (d.peaks || []).map((p: number) => p / 100);
+      setAudioDuration(d.duration || 0);
+      setPeaksVersion((v) => v + 1);
+      setAudioUrl(d.audioUrl);
+      setSaveStatus("saved");
+
+      if (d.transcription) {
+        setTranscription(d.transcription);
+        setSegments(d.segments || []);
+      } else {
+        // Clase guardada sin transcribir: se descarga el audio para poder transcribirla
+        const blob = await (await fetch(d.audioUrl)).blob();
+        setAudioBlob(blob);
+        await prepareAudio(blob, false, false);
+      }
+    } catch (err) {
+      resetRecording();
+      alert(err instanceof Error ? err.message : "No pude abrir esta clase.");
+    } finally {
+      setOpeningId("");
+    }
+  };
+
+  const deleteSession = async (id: string) => {
+    if (!confirm("¿Borrar esta clase y su audio de la nube? No se puede deshacer.")) return;
+    try {
+      const r = await fetch(`/api/storage/session?id=${encodeURIComponent(id)}`, { method: "DELETE" });
+      if (!r.ok) throw new Error();
+      setSessions((prev) => prev.filter((s) => s.id !== id));
+    } catch {
+      alert("No se pudo borrar la clase.");
+    }
+  };
+
   // ---------- Preparar audio ----------
-  const prepareAudio = async (blob: Blob, isUpload: boolean) => {
+  const prepareAudio = async (blob: Blob, isUpload: boolean, persist = true) => {
     setPreparing(true);
     setPrepareError("");
     setAudioReady(false);
@@ -3503,6 +3702,7 @@ export default function Home() {
       setPeaksVersion((v) => v + 1);
       setProgress({ done: 0, total: planRef.current.length });
       setAudioReady(true);
+      if (persist) uploadAudio(blob, duration);
     } catch (err) {
       console.error(err);
       setPrepareError(
@@ -3655,6 +3855,16 @@ export default function Home() {
     setRecordingTime(0);
     setMicLost(false);
     setMode("answer");
+    sessionIdRef.current = "";
+    audioKeyRef.current = "";
+    audioTypeRef.current = "";
+    titleRef.current = "";
+    createdAtRef.current = "";
+    durationRef.current = 0;
+    transcriptRef.current = { text: "", segments: [] };
+    pendingRef.current = null;
+    setSaveStatus("idle");
+    setSaveError("");
   };
 
   // ---------- Reproducción y marcas ----------
@@ -3834,8 +4044,22 @@ export default function Home() {
       );
     } else {
       const all = results as ChunkResult[];
-      setTranscription(all.map((r) => r.text.trim()).filter(Boolean).join(" ") || "No se detectó voz.");
-      setSegments(all.flatMap((r) => r.segments));
+      const fullText = all.map((r) => r.text.trim()).filter(Boolean).join(" ") || "No se detectó voz.";
+      const allSegs = all.flatMap((r) => r.segments);
+      setTranscription(fullText);
+      setSegments(allSegs);
+      transcriptRef.current = { text: fullText, segments: allSegs };
+      saveSession()
+        .then((ok) => {
+          if (ok) {
+            setSaveStatus("saved");
+            refreshSessions();
+          }
+        })
+        .catch((e) => {
+          setSaveStatus("error");
+          setSaveError(e instanceof Error ? e.message : "No se pudo guardar la transcripción.");
+        });
     }
 
     setProcessStatus("");
@@ -4244,6 +4468,8 @@ export default function Home() {
     });
   if (online && health && !health.gemini)
     notices.push({ level: "warn", text: "La IA de preguntas no responde ahora. Las respuestas pueden fallar." });
+  if (saveStatus === "error")
+    notices.push({ level: "warn", text: saveError || "No se pudo guardar la clase en la nube." });
 
   const noticeStyle: Record<Notice["level"], { box: string; dot: string }> = {
     error: { box: "bg-red-50 text-red-900 dark:bg-red-950/40 dark:text-red-200", dot: "bg-red-500" },
@@ -4356,8 +4582,17 @@ export default function Home() {
                       </div>
                     </div>
                     <div className="mt-3 flex items-center justify-between">
-                      <span className="font-mono text-xs tabular-nums text-zinc-500">
-                        {fmt(currentTime)} / {fmt(audioDuration)}
+                      <span className="flex items-center gap-3">
+                        <span className="font-mono text-xs tabular-nums text-zinc-500">
+                          {fmt(currentTime)} / {fmt(audioDuration)}
+                        </span>
+                        {saveStatus === "saving" && <span className="text-xs text-zinc-500">Guardando en la nube…</span>}
+                        {saveStatus === "saved" && <span className="text-xs text-emerald-600 dark:text-emerald-400">Guardada ✓</span>}
+                        {saveStatus === "error" && (
+                          <button onClick={retrySave} className={`${linkBtn} !text-amber-700 dark:!text-amber-300`}>
+                            No se guardó · Reintentar
+                          </button>
+                        )}
                       </span>
                       <button onClick={resetRecording} className={linkBtn}>
                         Empezar de nuevo
@@ -4384,6 +4619,51 @@ export default function Home() {
                 </div>
               )}
             </section>
+
+            {!isRecording && !audioUrl && (sessions.length > 0 || sessionsLoading || !!sessionsError) && (
+              <section className="space-y-3" aria-label="Clases guardadas">
+                <h2 className="px-1 text-sm font-medium text-zinc-600 dark:text-zinc-400">Clases guardadas</h2>
+                {sessionsLoading && sessions.length === 0 && (
+                  <div className="flex items-center gap-2 px-1 text-sm text-zinc-500">
+                    <Spinner />
+                    <span>Cargando...</span>
+                  </div>
+                )}
+                {sessionsError && <p className="px-1 text-sm text-zinc-500">{sessionsError}</p>}
+                {sessions.length > 0 && (
+                  <div className="max-h-80 overflow-y-auto overscroll-contain pr-1">
+                    <ul className="space-y-2">
+                      {sessions.map((s) => (
+                        <li key={s.id} className="flex items-center gap-1 rounded-2xl bg-zinc-50 p-1 dark:bg-zinc-900/60">
+                          <button
+                            onClick={() => openSession(s.id)}
+                            disabled={!!openingId}
+                            className={`flex min-w-0 flex-1 items-center gap-3 rounded-2xl p-2.5 text-left transition hover:bg-zinc-100 disabled:opacity-60 dark:hover:bg-zinc-900 ${focusRing}`}
+                          >
+                            <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-white text-violet-700 shadow-sm dark:bg-zinc-800 dark:text-violet-300">
+                              {openingId === s.id ? <Spinner /> : <PlayIcon size={16} />}
+                            </span>
+                            <span className="min-w-0">
+                              <span className="block truncate text-sm font-medium">{s.title}</span>
+                              <span className="block text-xs text-zinc-500">
+                                {fmt(s.duration)} · {s.hasTranscript ? "transcrita" : "sin transcribir"}
+                              </span>
+                            </span>
+                          </button>
+                          <button
+                            onClick={() => deleteSession(s.id)}
+                            className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-zinc-400 transition hover:text-red-500 ${focusRing}`}
+                            aria-label={`Borrar ${s.title}`}
+                          >
+                            ✕
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </section>
+            )}
 
             {transcription && (
               <section className="rounded-3xl border border-zinc-200 bg-zinc-50 p-5 dark:border-zinc-800 dark:bg-zinc-900/60 sm:p-6">
