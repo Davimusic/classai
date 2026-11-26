@@ -6,6 +6,7 @@ const MAX_CLASS_CHARS = 300_000;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 type Seg = { start: number; end: number; text: string };
+type Opt = { text: string; ok: boolean };
 
 function shuffle<T>(arr: T[]): T[] {
   const a = [...arr];
@@ -119,22 +120,24 @@ ${docsText || "Ninguno"}`;
             const parsed = JSON.parse(raw);
             const questions = (parsed.questions ?? [])
               .map((q: any) => {
-                const options = Array.isArray(q.options) ? q.options.map((o: any) => String(o)) : [];
+                const options: string[] = Array.isArray(q.options)
+                  ? q.options.map((o: any) => String(o))
+                  : [];
                 const correct = Number(q.correct);
                 if (!q.question || options.length !== 4 || !Number.isInteger(correct) || correct < 0 || correct > 3) {
                   return null;
                 }
                 // Mezcla las opciones para que la correcta no caiga siempre en la misma posición
-                const tagged = options.map((text: string, i: number) => ({ text, ok: i === correct }));
-                const mixed = shuffle(tagged);
+                const tagged: Opt[] = options.map((text: string, i: number) => ({ text, ok: i === correct }));
+                const mixed: Opt[] = shuffle<Opt>(tagged);
                 const at = Number(q.at);
                 return {
                   question: String(q.question),
-                  options: mixed.map((o) => o.text),
-                  correct: mixed.findIndex((o) => o.ok),
+                  options: mixed.map((o: Opt) => o.text),
+                  correct: mixed.findIndex((o: Opt) => o.ok),
                   explanation: String(q.explanation || ""),
                   ref: String(q.ref || ""),
-                  at: q.at !== null && Number.isFinite(at) && at >= 0 ? at : null,
+                  at: q.at !== null && q.at !== undefined && Number.isFinite(at) && at >= 0 ? at : null,
                 };
               })
               .filter(Boolean)
